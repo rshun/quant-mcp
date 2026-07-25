@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+
+# 虚拟环境
+.venv/
+venv/
+
+# 数据库文件不入库（体积大且由 spring 生产）
+*.db
+*.duckdb
+
+# IDE / 系统
+.idea/
+.vscode/
+.DS_Store

@@ -1,0 +1,18 @@
+{
+  "//": "MCP 客户端配置示例。放到各消费项目的 .mcp.json，或合并进 Claude 客户端的 mcpServers 配置。",
+  "//command": "command 必须指向虚拟环境里的 python 解释器绝对路径——MCP 客户端直接拉起子进程，不会激活 venv。Windows 用 .venv/Scripts/python.exe，Linux/macOS 用 .venv/bin/python。",
+  "//path": "把下面所有 <...> 占位符替换成本机实际绝对路径；QUANT_DB_PATH 指向本机 DuckDB 库文件。",
+  "mcpServers": {
+    "quant-readonly": {
+      "command": "<QUANT_MCP_DIR>/.venv/Scripts/python.exe",
+      "args": ["<QUANT_MCP_DIR>/server.py"],
+      "env": {
+        "QUANT_DB_PATH": "<PATH_TO>/quant.db",
+        "MAX_ROWS": "2000",
+        "MAX_DAYS": "800",
+        "ALLOW_RAW_QUERY": "0",
+        "LOG_LEVEL": "INFO"
+      }
+    }
+  }
+}

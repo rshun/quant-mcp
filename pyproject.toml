@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "quant-mcp"
+version = "0.1.0"
+description = "只读 MCP 服务：将本地 DuckDB 量化数据以标准 MCP Tool 暴露给大模型"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = [
+    "mcp==1.25.0",
+    "duckdb==1.4.3",
+    "pandas==2.3.3",
+]
+
+# 安装后提供命令行入口 `quant-mcp`，等价于 `python server.py`
+[project.scripts]
+quant-mcp = "server:main"
+
+[tool.setuptools]
+py-modules = ["server", "schema"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
