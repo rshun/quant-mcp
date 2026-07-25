@@ -1,6 +1,9 @@
 # 修改记录:
 #   2026-07-25  Claude  新建：每个 MCP Tool 的正例(happy path)冒烟测试
+#   2026-07-25  Claude  新增：返回值 JSON 可序列化断言(datetime/NaT 列曾导致序列化失败)
 """正例：各 Tool 在正常输入下返回预期结果。"""
+import json
+
 import pytest
 
 
@@ -112,3 +115,22 @@ def test_query_disabled_by_default(srv):
     # ALLOW_RAW_QUERY 未开启 -> 原始 SQL 工具应被拒绝
     with pytest.raises(RuntimeError):
         srv.query("SELECT 1")
+
+
+# ---- 返回值必须可 JSON 序列化(datetime/NaT 列曾导致 MCP 序列化失败) ----
+def test_search_stock_json_serializable(srv):
+    r = srv.search_stock("300085")
+    json.dumps(r)  # STOCK_INFO 含 Timestamp/NaT 列，不得抛异常
+
+
+def test_get_stock_info_json_serializable(srv):
+    r = srv.get_stock_info("300085.SZ")
+    json.dumps(r)
+
+
+def test_datetime_column_serialized_as_string(srv):
+    r = srv.search_stock("300085.SZ")
+    row = r["rows"][0]
+    # list_date 应为 ISO 字符串；delist_date(NULL)应为 None
+    assert isinstance(row["list_date"], str)
+    assert row["delist_date"] is None

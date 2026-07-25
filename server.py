@@ -2,6 +2,8 @@
 #   2026-07-25  Claude  从 spring 项目 mcp_server/server.py 剥离为独立仓库 quant-mcp；
 #                       去除对 spring util.myutil 的依赖，改由环境变量 QUANT_DB_PATH 注入库路径
 #   2026-07-25  Claude  表名/视图名/交易所枚举/服务名统一改为引用 schema.py，消除散落的写死字面量
+#   2026-07-25  Claude  修复 df_to_payload 对 datetime/Timestamp/NaT 列的 JSON 序列化失败
+#                       (search_stock/get_stock_info 等对含 datetime 列的表报错)
 import os
 import sys
 import re
@@ -103,8 +105,13 @@ def df_to_payload(df: pd.DataFrame, max_rows: int) -> dict[str, Any]:
     if len(df) > max_rows:
         df = df.iloc[:max_rows].copy()
         truncated = True
-    # make JSON-safe
-    df = df.where(pd.notnull(df), None)
+    # make JSON-safe:
+    #   1) NaN/NaT/None 统一置 None
+    #   2) datetime/Timestamp/date 等转 ISO 字符串——否则 MCP 无法序列化
+    #      (NaT 底层为 float，会触发 "'float' object cannot be interpreted as an integer")
+    mask = df.notnull()
+    df = df.astype(object).where(mask, None)
+    df = df.map(lambda v: v.isoformat() if hasattr(v, "isoformat") else v)
     return {
         "columns": list(df.columns),
         "rows": df.to_dict(orient="records"),

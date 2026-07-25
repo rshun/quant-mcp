@@ -34,8 +34,12 @@ def load_server(db_path: str):
 
 # 建表 + 样本数据（日期类列用 VARCHAR ISO 字符串，便于与字符串参数做 BETWEEN 比较）
 _DDL = [
-    """CREATE TABLE STOCK_INFO(code VARCHAR, symbol VARCHAR, exchange VARCHAR, name VARCHAR)""",
-    """INSERT INTO STOCK_INFO VALUES ('300085.SZ','300085','SZ','银之杰')""",
+    # 含 datetime 列，且 delist_date 为 NULL(-> NaT)，复现 JSON 序列化问题
+    """CREATE TABLE STOCK_INFO(
+        code VARCHAR, symbol VARCHAR, exchange VARCHAR, name VARCHAR,
+        list_date DATE, delist_date DATE, created_at TIMESTAMP)""",
+    """INSERT INTO STOCK_INFO VALUES
+        ('300085.SZ','300085','SZ','银之杰', DATE '2010-05-26', NULL, TIMESTAMP '2026-01-18 15:59:24')""",
 
     """CREATE TABLE TRADE_CAL(cal_date VARCHAR, is_open INTEGER)""",
     """INSERT INTO TRADE_CAL VALUES
