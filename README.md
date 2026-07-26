@@ -6,7 +6,7 @@
 
 ## 特性
 
-- **只读保护**：内部固定 `read_only=True`，并在应用层拦截所有 DDL/DML/管理类语句。
+- **只读保护**：内部固定 `read_only=True`，并在应用层拦截所有 DDL/DML/管理类语句；原始 SQL 一律被子查询包裹后强制加 `LIMIT`。
 - **短连接**：每次请求 Connect-Per-Request，避免锁表与多线程死锁。
 - **零反向依赖**：不依赖 spring 的任何 Python 代码，库路径由环境变量 `QUANT_DB_PATH` 注入。
 
@@ -44,10 +44,14 @@ pip install -r requirements.txt
 | 环境变量 | 必填 | 默认 | 说明 |
 |----------|------|------|------|
 | `QUANT_DB_PATH` | ✅ | — | DuckDB 库文件的完整路径 |
-| `MAX_ROWS` | | `2000` | 单次返回最大行数上限 |
-| `MAX_DAYS` | | `800` | 单次请求日期跨度上限（天） |
+| `MAX_ROWS` | | `2000` | 各 Tool `max_rows` 参数的**默认值兼上限**；调用方传更大的值会被收敛回该上限。自身受 20000 硬顶保护 |
+| `MAX_DAYS` | | `800` | 行情类 Tool（`get_stock_daily` / `get_daily_basic` / `get_adj_factor` / `get_margin_*` / `calc_indicators`）的日期跨度上限（天） |
 | `ALLOW_RAW_QUERY` | | `0` | 是否开放 `query` 原始 SQL 工具（`1` 开启） |
 | `LOG_LEVEL` | | `INFO` | 日志级别 |
+
+> `get_trade_days`（交易日历，上限 5000 天）和 `get_capital_detail`（股本变动按全部历史查询，上限 20000 天）语义上就需要长跨度，不受 `MAX_DAYS` 约束。
+>
+> 返回体中的 `truncated` 为 `true` 表示结果被截断（无论截断发生在 SQL 的 `LIMIT` 还是返回前的行数收敛），后面可能还有数据。
 
 ## 运行
 
@@ -89,8 +93,8 @@ $env:QUANT_DB_PATH="<PATH_TO>/quant.db"; python server.py
 
 | Tool | 说明 |
 |------|------|
-| `list_tables` / `describe_table` | 列出表、查看表结构（运行时自省，自动适应 schema） |
-| `search_stock` / `get_stock_info` | 按关键字/代码检索股票基础信息 |
+| `list_tables` / `describe_table` | 列出表与视图、查看表结构（运行时自省，自动适应 schema） |
+| `search_stock` / `get_stock_info` | 按关键字/代码检索股票基础信息（`get_stock_info` 返回 `found` 标志区分「查不到」与「字段为空」） |
 | `get_trade_days` | 交易日历 |
 | `get_stock_daily` | 日线行情 |
 | `get_daily_basic` | 每日基础指标（换手率、市值、is_st 等） |

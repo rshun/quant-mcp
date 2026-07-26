@@ -4,10 +4,20 @@
 #   2026-07-25  Claude  表名/视图名/交易所枚举/服务名统一改为引用 schema.py，消除散落的写死字面量
 #   2026-07-25  Claude  修复 df_to_payload 对 datetime/Timestamp/NaT 列的 JSON 序列化失败
 #                       (search_stock/get_stock_info 等对含 datetime 列的表报错)
+#   2026-07-26  Claude  代码走查修复 7 项:
+#                       1) add_limit_if_missing -> enforce_limit，改为子查询包裹，避免行注释吞掉 LIMIT
+#                       2) list_tables 纳入 VIEW，否则行业视图对自省不可见
+#                       3) df_to_payload 增加 sql_limit，SQL 层截断也标记 truncated
+#                       4) df_to_payload 补齐 INTERVAL/BLOB/LIST/UUID 的 JSON 安全转换
+#                       5) parse_code 返回规范化 code，各 Tool 用它入 SQL(原先带空白会查空)
+#                       6) MAX_ROWS/MAX_DAYS 环境变量真正生效，与 README 对齐
+#                       7) get_stock_info 返回 found 标志，不再静默降级
 import os
 import sys
 import re
-from datetime import datetime
+import uuid
+from datetime import datetime, timedelta
+from decimal import Decimal
 from typing import Any
 
 # Fix Windows GBK encoding issues
@@ -37,8 +47,14 @@ if not DB_PATH:
     )
 
 # Safety / stability guards
-MAX_ROWS_DEFAULT = int(os.environ.get("MAX_ROWS", "2000"))
-MAX_DAYS_DEFAULT = int(os.environ.get("MAX_DAYS", "800"))  # limit per request
+# MAX_ROWS 既是各 Tool 返回行数的默认值，也是其上限(与 README 表述一致)；
+# ABS_MAX_ROWS 是绝对硬顶，防止 MAX_ROWS 被配得过大而拖垮进程。
+ABS_MAX_ROWS = 20000
+MAX_ROWS_DEFAULT = max(1, min(int(os.environ.get("MAX_ROWS", "2000")), ABS_MAX_ROWS))
+MAX_DAYS_DEFAULT = int(os.environ.get("MAX_DAYS", "800"))  # 行情类 Tool 的日期跨度上限
+# 两个不受 MAX_DAYS 约束的例外——语义上就需要长跨度，故单独取名而非散落的字面量：
+TRADE_CAL_MAX_DAYS = 5000   # 交易日历是低频小表，按年查很常见
+CAPITAL_MAX_DAYS = 20000    # 股本变动按「全部历史」查询
 ALLOW_RAW_QUERY = os.environ.get("ALLOW_RAW_QUERY", "0").strip() == "1"
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
 
@@ -83,6 +99,22 @@ def parse_code(code: str) -> tuple[str, str]:
     return symbol, exch
 
 
+def normalize_code(code: str) -> str:
+    """
+    " 300085.sz " -> "300085.SZ"
+
+    _CODE_RE 容忍首尾空白与小写后缀，但 SQL 里 code 是按字面量比较的，
+    必须用规范化后的值入参，否则校验通过却静默查空。
+    """
+    symbol, exch = parse_code(code)
+    return f"{symbol}.{exch}"
+
+
+def clamp_rows(n: int) -> int:
+    """把请求行数收敛到 [1, MAX_ROWS_DEFAULT]。"""
+    return max(1, min(int(n), MAX_ROWS_DEFAULT))
+
+
 def validate_date(d: str) -> str:
     if not _DATE_RE.match(d or ""):
         raise ValueError("date must be YYYY-MM-DD")
@@ -100,18 +132,49 @@ def ensure_span(start: str, end: str, max_days: int) -> None:
         raise ValueError(f"date span too large: {days} days > max_days={max_days}")
 
 
-def df_to_payload(df: pd.DataFrame, max_rows: int) -> dict[str, Any]:
-    truncated = False
+def _json_safe(v: Any) -> Any:
+    """把 DuckDB 取回的非 JSON 原生类型转成可序列化值。
+
+    实测(duckdb 1.4.3 + pandas 2.3.3) fetchdf 后仍会 json.dumps 失败的类型：
+    INTERVAL->pd.Timedelta、BLOB->bytearray、LIST/ARRAY->np.ndarray、UUID->uuid.UUID。
+    DECIMAL/HUGEINT 已被转成 float64，此处的 Decimal 分支只作防御。
+
+    注意顺序：pd.Timedelta 既是 datetime.timedelta 子类又带 isoformat()，
+    必须先判 timedelta，否则会输出 'P0DT0H2M0S' 这种 ISO 时长串而非秒数。
+    """
+    if isinstance(v, timedelta):           # INTERVAL -> 秒
+        return v.total_seconds()
+    if hasattr(v, "isoformat"):            # datetime / date / Timestamp
+        return v.isoformat()
+    if isinstance(v, Decimal):             # DECIMAL(防御) —— 与 DOUBLE 列同为数值
+        return float(v)
+    if isinstance(v, (bytes, bytearray)):  # BLOB
+        return v.hex()
+    if isinstance(v, uuid.UUID):           # UUID
+        return str(v)
+    if hasattr(v, "tolist"):               # np.ndarray(LIST/ARRAY) 及 numpy 标量
+        return v.tolist()
+    return v
+
+
+def df_to_payload(df: pd.DataFrame, max_rows: int, sql_limit: int | None = None) -> dict[str, Any]:
+    """把 DataFrame 转为 Tool 返回体。
+
+    sql_limit: 调用方在 SQL 里已用 LIMIT 截断时传入该值。行数正好顶到 limit
+    说明后面可能还有数据，同样要标记 truncated——否则调用方(大模型)会把
+    截断结果当成全量。
+    """
+    truncated = sql_limit is not None and len(df) >= sql_limit
     if len(df) > max_rows:
         df = df.iloc[:max_rows].copy()
         truncated = True
     # make JSON-safe:
     #   1) NaN/NaT/None 统一置 None
-    #   2) datetime/Timestamp/date 等转 ISO 字符串——否则 MCP 无法序列化
+    #   2) datetime/Decimal/timedelta/bytes 等转可序列化值——否则 MCP 无法序列化
     #      (NaT 底层为 float，会触发 "'float' object cannot be interpreted as an integer")
     mask = df.notnull()
     df = df.astype(object).where(mask, None)
-    df = df.map(lambda v: v.isoformat() if hasattr(v, "isoformat") else v)
+    df = df.map(_json_safe)
     return {
         "columns": list(df.columns),
         "rows": df.to_dict(orient="records"),
@@ -142,11 +205,14 @@ def table_exists(table: str) -> bool:
     return len(df) > 0
 
 
-def resolve_stock(code: str) -> dict[str, Any]:
+def resolve_stock(code: str) -> tuple[dict[str, Any], bool]:
     """
     code: '300085.SZ' (primary key in STOCK_INFO)
+
+    返回 (股票信息, 是否命中)。查不到时第二个值为 False，调用方据此区分
+    「查到但字段为空」与「根本没这只股票」，不再静默降级。
     """
-    _ = parse_code(code)  # only for validation
+    code = normalize_code(code)
     if table_exists(schema.TB_STOCK_INFO):
         df = run_sql(
             f"""
@@ -159,7 +225,7 @@ def resolve_stock(code: str) -> dict[str, Any]:
         )
         if len(df) == 1:
             out = df_to_payload(df, 1)
-            return out["rows"][0]
+            return out["rows"][0], True
 
         # optional fallback: derive symbol/exchange and try (symbol, exchange)
         symbol, exch = parse_code(code)
@@ -174,16 +240,21 @@ def resolve_stock(code: str) -> dict[str, Any]:
         )
         if len(df2) == 1:
             out = df_to_payload(df2, 1)
-            return out["rows"][0]
+            return out["rows"][0], True
 
-    return {"code": code}
+    return {"code": code}, False
 
 
-def add_limit_if_missing(sql: str, max_rows: int) -> str:
-    # simple heuristic: if no LIMIT, append one
-    if re.search(r"\bLIMIT\b", sql, re.IGNORECASE):
-        return sql
-    return sql.rstrip().rstrip(";") + f" LIMIT {int(max_rows)}"
+def enforce_limit(sql: str, max_rows: int) -> str:
+    """用子查询包裹后统一加 LIMIT（原 add_limit_if_missing，语义已从「缺则补」改为「总是加」）。
+
+    不再用「检测到 LIMIT 就跳过」的启发式：那样既会被子查询/字符串里的
+    LIMIT 字样误判，追加的 LIMIT 也会被结尾的 `--` 行注释整体吞掉，
+    导致全表被 fetch 进 pandas。包裹后外层 LIMIT 总是生效，且对
+    SELECT 与 WITH...SELECT 都语义等价(只是额外收紧行数)。
+    """
+    q = sql.rstrip().rstrip(";")
+    return f"SELECT * FROM (\n{q}\n) AS _q LIMIT {int(max_rows)}"
 
 
 def validate_raw_query(sql: str) -> None:
@@ -208,13 +279,15 @@ def validate_raw_query(sql: str) -> None:
 @mcp.tool()
 def list_tables() -> dict[str, Any]:
     """
-    List all base tables in DuckDB.
+    List all base tables and views in DuckDB.
     """
+    # 必须含 VIEW：契约对象里 STOCK_SW_INDUSTRY_VIEW 是视图，
+    # 只列 BASE TABLE 会让行业数据在自省时“不存在”。
     df = run_sql(
         """
-        SELECT table_schema, table_name
+        SELECT table_schema, table_name, table_type
         FROM information_schema.tables
-        WHERE table_type='BASE TABLE'
+        WHERE table_type IN ('BASE TABLE', 'VIEW')
         ORDER BY table_schema, table_name
         """
     )
@@ -250,7 +323,7 @@ def search_stock(keyword: str, limit: int = 20) -> dict[str, Any]:
     kw = (keyword or "").strip()
     if not kw:
         raise ValueError("keyword is required")
-    limit = max(1, min(int(limit), 200))
+    limit = min(clamp_rows(limit), 200)
 
     if _CODE_RE.match(kw):
         df = run_sql(
@@ -260,7 +333,7 @@ def search_stock(keyword: str, limit: int = 20) -> dict[str, Any]:
             WHERE UPPER(code) = UPPER(?)
             LIMIT 1
             """,
-            [kw],
+            [normalize_code(kw)],
         )
         if len(df) > 0:
             return df_to_payload(df, limit)
@@ -278,27 +351,33 @@ def search_stock(keyword: str, limit: int = 20) -> dict[str, Any]:
         """,
         [f"{kw}%", f"{kw}%", f"%{kw}%", limit],
     )
-    return df_to_payload(df, limit)
+    return df_to_payload(df, limit, sql_limit=limit)
 
 
 @mcp.tool()
 def get_stock_info(code: str) -> dict[str, Any]:
     """
     Get single stock info by code (e.g., 300085.SZ).
+    found=false 表示 STOCK_INFO 中没有这只股票(而非查到了但字段为空)。
     """
-    info = resolve_stock(code)
-    return {"stock": info}
+    info, found = resolve_stock(code)
+    return {"stock": info, "found": found}
 
 
 @mcp.tool()
-def get_trade_days(start_date: str, end_date: str, open_only: bool = True, limit: int = 5000) -> dict[str, Any]:
+def get_trade_days(
+    start_date: str,
+    end_date: str,
+    open_only: bool = True,
+    limit: int = MAX_ROWS_DEFAULT,
+) -> dict[str, Any]:
     """
     TRADE_CAL(cal_date, is_open)
     """
     start_date = validate_date(start_date)
     end_date = validate_date(end_date)
-    ensure_span(start_date, end_date, max_days=5000)
-    limit = max(1, min(int(limit), 20000))
+    ensure_span(start_date, end_date, max_days=TRADE_CAL_MAX_DAYS)
+    limit = clamp_rows(limit)
 
     if not table_exists(schema.TB_TRADE_CAL):
         raise RuntimeError(f"{schema.TB_TRADE_CAL} table not found.")
@@ -326,21 +405,21 @@ def get_trade_days(start_date: str, end_date: str, open_only: bool = True, limit
             """,
             [start_date, end_date, limit],
         )
-    return df_to_payload(df, limit)
+    return df_to_payload(df, limit, sql_limit=limit)
 
 
-@mcp.tool()
-def get_stock_daily(
+def _query_stock_daily(
     code: str,
     start_date: str,
     end_date: str,
-    fields: list[str] | None = None,
-    max_rows: int = 2000,
-) -> dict[str, Any]:
+    fields: list[str] | None,
+) -> pd.DataFrame:
+    """取日线原始 DataFrame（不做行数截断）。
+
+    行数由 MAX_DAYS 的跨度上限间接约束。calc_indicators 直接复用本函数，
+    避免「先按 max_rows 截断、再在截断数据上算均线」而算出错误指标。
     """
-    STOCK_DAILY(code, date, open, high, low, close, volume, amount)
-    """
-    _ = parse_code(code)  # validate '300085.SZ'
+    code = normalize_code(code)
     start_date = validate_date(start_date)
     end_date = validate_date(end_date)
     ensure_span(start_date, end_date, MAX_DAYS_DEFAULT)
@@ -348,7 +427,6 @@ def get_stock_daily(
     if not table_exists(schema.TB_STOCK_DAILY):
         raise RuntimeError(f"{schema.TB_STOCK_DAILY} table not found.")
 
-    max_rows = max(1, min(int(max_rows), 20000))
     default_fields = ["date", "open", "high", "low", "close", "volume", "amount"]
     use_fields = fields if fields else default_fields
 
@@ -359,7 +437,7 @@ def get_stock_daily(
         clean_fields.append(c)
     cols = ", ".join(clean_fields)
 
-    df = run_sql(
+    return run_sql(
         f"""
         SELECT {cols}
         FROM {schema.TB_STOCK_DAILY}
@@ -369,7 +447,21 @@ def get_stock_daily(
         """,
         [code, start_date, end_date],
     )
-    return df_to_payload(df, max_rows)
+
+
+@mcp.tool()
+def get_stock_daily(
+    code: str,
+    start_date: str,
+    end_date: str,
+    fields: list[str] | None = None,
+    max_rows: int = MAX_ROWS_DEFAULT,
+) -> dict[str, Any]:
+    """
+    STOCK_DAILY(code, date, open, high, low, close, volume, amount)
+    """
+    df = _query_stock_daily(code, start_date, end_date, fields)
+    return df_to_payload(df, clamp_rows(max_rows))
 
 
 @mcp.tool()
@@ -377,12 +469,12 @@ def get_daily_basic(
     code: str,
     start_date: str,
     end_date: str,
-    max_rows: int = 2000,
+    max_rows: int = MAX_ROWS_DEFAULT,
 ) -> dict[str, Any]:
     """
     DAILY_BASIC(code, trade_date, turnover_rate, ... is_st)
     """
-    _ = parse_code(code)
+    code = normalize_code(code)
     start_date = validate_date(start_date)
     end_date = validate_date(end_date)
     ensure_span(start_date, end_date, MAX_DAYS_DEFAULT)
@@ -390,7 +482,7 @@ def get_daily_basic(
     if not table_exists(schema.TB_DAILY_BASIC):
         raise RuntimeError(f"{schema.TB_DAILY_BASIC} table not found.")
 
-    max_rows = max(1, min(int(max_rows), 20000))
+    max_rows = clamp_rows(max_rows)
 
     df = run_sql(
         f"""
@@ -411,7 +503,7 @@ def calc_indicators(
     start_date: str,
     end_date: str,
     ma_windows: list[int] | None = None,
-    max_rows: int = 2000,
+    max_rows: int = MAX_ROWS_DEFAULT,
 ) -> dict[str, Any]:
     """
     Calculate simple indicators from STOCK_DAILY:
@@ -422,12 +514,12 @@ def calc_indicators(
     if ma_windows is None or len(ma_windows) == 0:
         ma_windows = [5, 10, 20, 60]
 
-    base = get_stock_daily(code, start_date, end_date, fields=["date", "close", "volume"], max_rows=50000)
-    rows = base["rows"]
-    if not rows:
+    # 指标必须在完整区间上计算，故直接取原始 DataFrame，截断留到最后一步
+    df = _query_stock_daily(code, start_date, end_date, ["date", "close", "volume"])
+    if len(df) == 0:
         return {"columns": [], "rows": [], "rowcount": 0, "truncated": False}
 
-    df = pd.DataFrame(rows)
+    df = df.copy()
     df["date"] = pd.to_datetime(df["date"])
     df = df.sort_values("date").reset_index(drop=True)
     df["close"] = pd.to_numeric(df["close"], errors="coerce")
@@ -444,8 +536,7 @@ def calc_indicators(
 
     # keep JSON-friendly
     df["date"] = df["date"].dt.strftime("%Y-%m-%d")
-    out = df_to_payload(df, max_rows)
-    return out
+    return df_to_payload(df, clamp_rows(max_rows))
 
 
 @mcp.tool()
@@ -453,13 +544,13 @@ def get_adj_factor(
     code: str,
     start_date: str,
     end_date: str,
-    max_rows: int = 2000,
+    max_rows: int = MAX_ROWS_DEFAULT,
 ) -> dict[str, Any]:
     """
     ADJ_FACTOR(code, trade_date, fore_factor, back_factor, adjust_factor)
     获取复权因子，用于计算前/后复权价格。
     """
-    _ = parse_code(code)
+    code = normalize_code(code)
     start_date = validate_date(start_date)
     end_date = validate_date(end_date)
     ensure_span(start_date, end_date, MAX_DAYS_DEFAULT)
@@ -467,7 +558,7 @@ def get_adj_factor(
     if not table_exists(schema.TB_ADJ_FACTOR):
         raise RuntimeError(f"{schema.TB_ADJ_FACTOR} table not found.")
 
-    max_rows = max(1, min(int(max_rows), 20000))
+    max_rows = clamp_rows(max_rows)
 
     df = run_sql(
         f"""
@@ -491,6 +582,7 @@ def get_stock_industry(
     查询股票的申万行业分类（一/二/三级）。
     如果指定 trade_date，返回该日期生效的行业归属；否则返回最新记录。
     """
+    code = normalize_code(code)  # 结果里的 `? AS code` 需要回显规范化后的值
     symbol, _ = parse_code(code)
 
     if not table_exists(schema.VW_SW_INDUSTRY):
@@ -554,12 +646,13 @@ def get_stock_industry_history(
     code: str,
     start_date: str | None = None,
     end_date: str | None = None,
-    max_rows: int = 2000,
+    max_rows: int = MAX_ROWS_DEFAULT,
 ) -> dict[str, Any]:
     """
     查询股票申万行业分类历史（一/二/三级展开）。
     可选 start_date / end_date 按计入日期过滤。
     """
+    code = normalize_code(code)  # 结果里的 `? AS code` 需要回显规范化后的值
     symbol, _ = parse_code(code)
 
     if start_date:
@@ -572,7 +665,7 @@ def get_stock_industry_history(
     if not table_exists(schema.VW_SW_INDUSTRY):
         raise RuntimeError(f"{schema.VW_SW_INDUSTRY} view not found.")
 
-    max_rows = max(1, min(int(max_rows), 20000))
+    max_rows = clamp_rows(max_rows)
 
     filters = ["symbol = ?"]
     params: list[Any] = [symbol]
@@ -613,7 +706,7 @@ def get_margin_detail(
     code: str,
     start_date: str,
     end_date: str,
-    max_rows: int = 2000,
+    max_rows: int = MAX_ROWS_DEFAULT,
 ) -> dict[str, Any]:
     """
     MARGIN_DETAIL_DAILY(trade_date, exchange_code, symbol, code,
@@ -622,7 +715,7 @@ def get_margin_detail(
         short_balance_volume, short_balance_amount, margin_short_balance, ...)
     获取指定股票的融资融券明细数据。
     """
-    _ = parse_code(code)
+    code = normalize_code(code)
     start_date = validate_date(start_date)
     end_date = validate_date(end_date)
     ensure_span(start_date, end_date, MAX_DAYS_DEFAULT)
@@ -630,7 +723,7 @@ def get_margin_detail(
     if not table_exists(schema.TB_MARGIN_DETAIL):
         raise RuntimeError(f"{schema.TB_MARGIN_DETAIL} table not found.")
 
-    max_rows = max(1, min(int(max_rows), 20000))
+    max_rows = clamp_rows(max_rows)
 
     df = run_sql(
         f"""
@@ -654,7 +747,7 @@ def get_margin_summary(
     start_date: str,
     end_date: str,
     exchange_code: str | None = None,
-    max_rows: int = 2000,
+    max_rows: int = MAX_ROWS_DEFAULT,
 ) -> dict[str, Any]:
     """
     MARGIN_SUMMARY_DAILY(trade_date, exchange_code,
@@ -680,7 +773,7 @@ def get_margin_summary(
         filters.append("exchange_code = ?")
         params.append(ex)
 
-    max_rows = max(1, min(int(max_rows), 20000))
+    max_rows = clamp_rows(max_rows)
 
     df = run_sql(
         f"""
@@ -704,7 +797,7 @@ def get_capital_detail(
     start_date: str | None = None,
     end_date: str | None = None,
     category: str | None = None,
-    max_rows: int = 500,
+    max_rows: int = MAX_ROWS_DEFAULT,
 ) -> dict[str, Any]:
     """
     CAPITAL_DETAIL (GBBQ 股本变动/权息资料)
@@ -712,12 +805,12 @@ def get_capital_detail(
     category 可选: 除权除息 / 股本变化 / 送配股上市
     若不传日期则返回该股票全部历史记录。
     """
-    _ = parse_code(code)
+    code = normalize_code(code)
 
     if not table_exists(schema.TB_CAPITAL_DETAIL):
         raise RuntimeError(f"{schema.TB_CAPITAL_DETAIL} table not found.")
 
-    max_rows = max(1, min(int(max_rows), 20000))
+    max_rows = clamp_rows(max_rows)
 
     conditions = ["UPPER(code) = UPPER(?)"]
     params: list[Any] = [code]
@@ -733,7 +826,7 @@ def get_capital_detail(
         params.append(end_date)
 
     if start_date and end_date:
-        ensure_span(start_date, end_date, 20000)
+        ensure_span(start_date, end_date, CAPITAL_MAX_DAYS)
 
     if category:
         conditions.append("category = ?")
@@ -753,10 +846,9 @@ def get_capital_detail(
 
 
 @mcp.tool()
-def query(sql: str, max_rows: int = 2000) -> dict[str, Any]:
+def query(sql: str, max_rows: int = MAX_ROWS_DEFAULT) -> dict[str, Any]:
     """
-    Raw SQL query (read-only). DDL/DML is blocked. LIMIT will be appended if missing.
-    You can disable this tool by setting env ALLOW_RAW_QUERY=0.
+    Raw SQL query (read-only). DDL/DML is blocked. Result is always LIMIT-capped.
     """
     if not ALLOW_RAW_QUERY:
         raise RuntimeError("Raw query tool is disabled by server policy (ALLOW_RAW_QUERY=0).")
@@ -767,11 +859,11 @@ def query(sql: str, max_rows: int = 2000) -> dict[str, Any]:
 
     validate_raw_query(q)
 
-    max_rows = max(1, min(int(max_rows), 20000))
-    q2 = add_limit_if_missing(q, max_rows)
+    max_rows = clamp_rows(max_rows)
+    q2 = enforce_limit(q, max_rows)
 
     df = run_sql(q2)
-    return df_to_payload(df, max_rows)
+    return df_to_payload(df, max_rows, sql_limit=max_rows)
 
 
 def main() -> None:

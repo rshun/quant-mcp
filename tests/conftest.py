@@ -1,5 +1,8 @@
 # 修改记录:
 #   2026-07-25  Claude  新建：pytest 夹具——构造最小契约库、以隔离方式加载 server 模块
+#   2026-07-26  Claude  提高 fixture 保真度：STOCK_SW_INDUSTRY_VIEW 改建为真视图(生产库即为视图，
+#                       原先建成表会让 list_tables 只列 BASE TABLE 的缺陷测不出来)；
+#                       STOCK_INFO 补 DECIMAL 列，覆盖 JSON 序列化；新增 load_server_with_env
 """测试夹具。
 
 - `fixture_db`：一个临时 DuckDB 文件，含 schema.TABLES 全部对象与少量样本数据。
@@ -22,24 +25,44 @@ ROOT = Path(__file__).resolve().parents[1]
 SERVER_PATH = ROOT / "server.py"
 
 
-def load_server(db_path: str):
-    """以指定库路径加载一个全新、独立的 server 模块实例。"""
+def load_server(db_path: str, **env: str):
+    """以指定库路径加载一个全新、独立的 server 模块实例。
+
+    env: 额外的环境变量(如 MAX_ROWS / ALLOW_RAW_QUERY)，仅在本次加载期间生效，
+    加载完成后恢复原值，避免污染其他测试。
+    """
     os.environ["QUANT_DB_PATH"] = str(db_path)
-    name = f"server_{uuid.uuid4().hex}"
-    spec = importlib.util.spec_from_file_location(name, SERVER_PATH)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+    saved = {k: os.environ.get(k) for k in env}
+    os.environ.update(env)
+    try:
+        name = f"server_{uuid.uuid4().hex}"
+        spec = importlib.util.spec_from_file_location(name, SERVER_PATH)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
 
 
 # 建表 + 样本数据（日期类列用 VARCHAR ISO 字符串，便于与字符串参数做 BETWEEN 比较）
 _DDL = [
-    # 含 datetime 列，且 delist_date 为 NULL(-> NaT)，复现 JSON 序列化问题
+    # JSON 序列化的“毒列”集合，全部按实测挑选(duckdb 1.4.3 + pandas 2.3.3)：
+    #   delist_date NULL -> NaT；listing_gap INTERVAL -> pd.Timedelta；
+    #   raw_blob BLOB -> bytearray；tags LIST -> np.ndarray；row_id UUID -> uuid.UUID。
+    #   total_share DECIMAL 实际已被 fetchdf 转成 float64，留着确认它不会回退。
     """CREATE TABLE STOCK_INFO(
         code VARCHAR, symbol VARCHAR, exchange VARCHAR, name VARCHAR,
-        list_date DATE, delist_date DATE, created_at TIMESTAMP)""",
+        list_date DATE, delist_date DATE, created_at TIMESTAMP,
+        total_share DECIMAL(18,4), listing_gap INTERVAL,
+        raw_blob BLOB, tags VARCHAR[], row_id UUID)""",
     """INSERT INTO STOCK_INFO VALUES
-        ('300085.SZ','300085','SZ','银之杰', DATE '2010-05-26', NULL, TIMESTAMP '2026-01-18 15:59:24')""",
+        ('300085.SZ','300085','SZ','银之杰', DATE '2010-05-26', NULL,
+         TIMESTAMP '2026-01-18 15:59:24', 706123456.7800, INTERVAL 2 MINUTE,
+         BLOB 'ab', ['创业板','软件'], UUID '00000000-0000-0000-0000-000000000001')""",
 
     """CREATE TABLE TRADE_CAL(cal_date VARCHAR, is_open INTEGER)""",
     """INSERT INTO TRADE_CAL VALUES
@@ -66,15 +89,17 @@ _DDL = [
         ('300085.SZ','2026-07-01',1.0,2.5,2.5),
         ('300085.SZ','2026-07-02',1.0,2.5,2.5)""",
 
-    """CREATE TABLE STOCK_SW_INDUSTRY_VIEW(
+    # 生产库里行业对象是 VIEW，fixture 必须同构，否则测不出 list_tables 漏列视图
+    """CREATE TABLE SW_INDUSTRY_BASE(
         symbol VARCHAR, start_date VARCHAR, sw_version VARCHAR,
         sw_l1_code VARCHAR, sw_l1_name VARCHAR,
         sw_l2_code VARCHAR, sw_l2_name VARCHAR,
         sw_l3_code VARCHAR, sw_l3_name VARCHAR,
         industry_code VARCHAR, update_time VARCHAR, updated_at VARCHAR)""",
-    """INSERT INTO STOCK_SW_INDUSTRY_VIEW VALUES
+    """INSERT INTO SW_INDUSTRY_BASE VALUES
         ('300085','2026-01-01','2021','270000','计算机','270200','软件开发',
          '270201','行业应用软件','850831','2026-01-01','2026-01-01')""",
+    """CREATE VIEW STOCK_SW_INDUSTRY_VIEW AS SELECT * FROM SW_INDUSTRY_BASE""",
 
     """CREATE TABLE MARGIN_DETAIL_DAILY(
         trade_date VARCHAR, exchange_code VARCHAR, symbol VARCHAR, code VARCHAR,
@@ -123,6 +148,18 @@ def fixture_db(tmp_path_factory) -> str:
 @pytest.fixture(scope="session")
 def srv(fixture_db):
     return load_server(fixture_db)
+
+
+@pytest.fixture(scope="session")
+def srv_raw(fixture_db):
+    """开放了原始 SQL 工具的 server 实例。"""
+    return load_server(fixture_db, ALLOW_RAW_QUERY="1")
+
+
+@pytest.fixture(scope="session")
+def srv_small(fixture_db):
+    """MAX_ROWS=2 的 server 实例，用于验证环境变量真的收紧了返回行数。"""
+    return load_server(fixture_db, MAX_ROWS="2")
 
 
 @pytest.fixture
