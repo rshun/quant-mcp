@@ -10,7 +10,7 @@
 - `empty_db`：一个空库（无任何表），用于反例（缺表应报错）。
 - `load_server`：以指定库路径加载全新 server 模块的工厂。
 
-server.py 在导入时即从环境变量 QUANT_DB_PATH 读取库路径，故每次用唯一模块名
+server 模块在导入时即从环境变量 QUANT_DB_PATH 读取库路径，故每次用唯一模块名
 重新 exec，可让不同测试指向不同库而互不干扰。
 """
 import importlib.util
@@ -20,9 +20,10 @@ from pathlib import Path
 
 import duckdb
 import pytest
+import quant_mcp
 
 ROOT = Path(__file__).resolve().parents[1]
-SERVER_PATH = ROOT / "server.py"
+SERVER_PATH = ROOT / "src" / "quant_mcp" / "server.py"
 
 
 def load_server(db_path: str, **env: str):
@@ -35,7 +36,7 @@ def load_server(db_path: str, **env: str):
     saved = {k: os.environ.get(k) for k in env}
     os.environ.update(env)
     try:
-        name = f"server_{uuid.uuid4().hex}"
+        name = f"quant_mcp.server_{uuid.uuid4().hex}"
         spec = importlib.util.spec_from_file_location(name, SERVER_PATH)
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)

@@ -11,7 +11,7 @@ def test_list_tables(srv):
     r = srv.list_tables()
     names = {row["table_name"] for row in r["rows"]}
     # 契约中的 9 个对象都应存在
-    import schema
+    from quant_mcp import schema
     assert set(schema.TABLES).issubset(names)
 
 

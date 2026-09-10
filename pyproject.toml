@@ -13,15 +13,19 @@ dependencies = [
     "mcp==1.25.0",
     "duckdb==1.4.3",
     "pandas==2.3.3",
+    "PyYAML==6.0.3",
 ]
 
-# 安装后提供命令行入口 `quant-mcp`，等价于 `python server.py`
+# 安装后提供命令行入口 `quant-mcp`
 [project.scripts]
-quant-mcp = "server:main"
+quant-mcp = "quant_mcp.server:main"
 
 [tool.setuptools]
-py-modules = ["server", "schema"]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
 
 [tool.pytest.ini_options]
-pythonpath = ["."]
+pythonpath = ["src"]
 testpaths = ["tests"]

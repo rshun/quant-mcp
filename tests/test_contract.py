@@ -2,7 +2,7 @@
 #   2026-07-25  Claude  新建：跨仓库 schema 读契约测试(正例:表/列齐全;反例:缺表/坏输入/空数据)
 """契约测试。
 
-依据 schema.py 声明的读契约，断言库中结构满足要求（正例）；
+依据 quant_mcp.schema 声明的读契约，断言库中结构满足要求（正例）；
 并验证缺表、非法输入等异常场景能正确报错或安全降级（反例）。
 
 注意：本测试对着最小 fixture 库跑，只能保证「契约定义与 server 的 SQL 依赖一致」。
@@ -10,7 +10,7 @@
 """
 import pytest
 
-import schema
+from quant_mcp import schema
 from conftest import load_server
 
 

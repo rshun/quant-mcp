@@ -28,7 +28,8 @@ if sys.platform == "win32":
 import duckdb
 import pandas as pd
 
-import schema
+from . import schema
+from .pipeline import load_pipeline
 
 try:
     from mcp.server.fastmcp import FastMCP
@@ -276,6 +277,17 @@ def validate_raw_query(sql: str) -> None:
 # -----------------------------
 # Core MCP Tools
 # -----------------------------
+@mcp.tool()
+def get_etl_pipeline() -> dict[str, Any]:
+    """读取并返回 Spring ETL 程序依赖声明。"""
+    pipeline, source = load_pipeline()
+    return {
+        "source": str(source),
+        "program_count": len(pipeline),
+        "programs": pipeline,
+    }
+
+
 @mcp.tool()
 def list_tables() -> dict[str, Any]:
     """

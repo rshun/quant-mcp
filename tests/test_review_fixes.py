@@ -39,7 +39,7 @@ def test_query_marks_truncated_at_limit(srv_raw):
 
 # ---------- 2. list_tables 必须包含视图 ----------
 def test_list_tables_includes_views(srv):
-    import schema
+    from quant_mcp import schema
 
     r = srv.list_tables()
     names = {row["table_name"] for row in r["rows"]}

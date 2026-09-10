@@ -1,13 +1,14 @@
 {
   "//": "MCP 客户端配置示例。放到各消费项目的 .mcp.json，或合并进 Claude 客户端的 mcpServers 配置。",
-  "//command": "command 必须指向虚拟环境里的 python 解释器绝对路径——MCP 客户端直接拉起子进程，不会激活 venv。Windows 用 .venv/Scripts/python.exe，Linux/macOS 用 .venv/bin/python。",
-  "//path": "把下面所有 <...> 占位符替换成本机实际绝对路径；QUANT_DB_PATH 指向本机 DuckDB 库文件。",
+  "//command": "先用 pip install -e <QUANT_MCP_DIR> 安装本项目；command 指向虚拟环境中生成的 quant-mcp 入口。Windows 用 .venv/Scripts/quant-mcp.exe，Linux/macOS 用 .venv/bin/quant-mcp。",
+  "//path": "把下面所有 <...> 占位符替换成本机实际绝对路径；QUANT_DB_PATH 指向 DuckDB，SPRING_PIPELINE_PATH 指向 Spring 的 pipeline 配置。",
   "mcpServers": {
     "quant-readonly": {
-      "command": "<QUANT_MCP_DIR>/.venv/Scripts/python.exe",
-      "args": ["<QUANT_MCP_DIR>/server.py"],
+      "command": "<QUANT_MCP_DIR>/.venv/Scripts/quant-mcp.exe",
+      "args": [],
       "env": {
         "QUANT_DB_PATH": "<PATH_TO>/quant.db",
+        "SPRING_PIPELINE_PATH": "<SPRING_DIR>/config/pipeline.yaml",
         "MAX_ROWS": "2000",
         "MAX_DAYS": "800",
         "ALLOW_RAW_QUERY": "0",
