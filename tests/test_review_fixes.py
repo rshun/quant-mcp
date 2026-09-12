@@ -154,3 +154,21 @@ def test_get_stock_info_found_false(srv):
     r = srv.get_stock_info("999999.SZ")
     assert r["found"] is False
     assert r["stock"] == {"code": "999999.SZ"}
+
+
+# ---------- 8. 数值列的 NULL 必须序列化为 None，不能退化成 NaN ----------
+# 2026-09-12 发现的既有缺陷：df_to_payload 先用 where(mask, None) 把空值置 None，
+# 随后的 df.map(_json_safe) 会让 pandas 按列重新推断 dtype——纯数值+None 的列被推回
+# float64，None 又变成 NaN。NaN 不是合法 JSON 字面量，严格解析的客户端会直接失败，
+# 宽松的则把它当成一个「有值」的数字。
+def test_null_numeric_column_serialized_as_none(srv):
+    # 必须取「有值 + NULL」混合的两行：只有 NULL 的单行列 pandas 推不出数值类型，
+    # 会侥幸保持 object，断言不到缺陷。
+    r = srv.get_adj_factor("300085.SZ", "2026-07-01", "2026-07-02")
+    assert r["rows"][0]["fore_factor"] == 1.0
+    assert r["rows"][1]["fore_factor"] is None
+
+
+def test_payload_contains_no_nan_literal(srv):
+    r = srv.get_adj_factor("300085.SZ", "2026-07-01", "2026-07-02")
+    json.dumps(r, allow_nan=False)  # 含 NaN 时 allow_nan=False 会抛 ValueError

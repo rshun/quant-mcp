@@ -224,17 +224,39 @@ Claude Code 的配置优先级是 `local` > `project` > `user`。如果 `user` s
 | Tool | 说明 |
 |------|------|
 | `get_etl_pipeline` | 从 `SPRING_PIPELINE_PATH` 读取并校验 Spring ETL 程序依赖声明 |
-| `list_tables` / `describe_table` | 列出表与视图、查看表结构（运行时自省，自动适应 schema） |
+| `list_tables` / `describe_table` | 列出表与视图、查看表结构（运行时自省，自动适应 schema）；`list_tables` 随行返回 `deprecated` / `note`，标出不该被消费的对象 |
 | `search_stock` / `get_stock_info` | 按关键字/代码检索股票基础信息（`get_stock_info` 返回 `found` 标志区分「查不到」与「字段为空」） |
 | `get_trade_days` | 交易日历 |
-| `get_stock_daily` | 日线行情 |
+| `get_stock_daily` | 日线行情（默认字段含 `pre_close` / `tradestatus`） |
 | `get_daily_basic` | 每日基础指标（换手率、市值、is_st 等） |
-| `calc_indicators` | 基于日线计算收益率 / MA / 量能均线 |
-| `get_adj_factor` | 复权因子 |
+| `calc_indicators` | 基于日线计算收益率 / MA / 量能均线（停牌日 `ret_1d` 置空） |
+| `get_adj_factor` | 复权因子（`fore_factor` 口径见下方「数据口径提示」） |
 | `get_stock_industry` / `get_stock_industry_history` | 申万行业分类（当前 / 历史） |
 | `get_margin_detail` / `get_margin_summary` | 融资融券明细 / 交易所汇总 |
 | `get_capital_detail` | 股本变动 / 权息资料（GBBQ） |
 | `query` | 只读原始 SQL（默认关闭，`ALLOW_RAW_QUERY=1` 开启） |
+
+## 数据口径提示
+
+以下三条是 spring 在 2026-09 的语义变更，会静默影响分析结果，Tool 的返回体与描述里都已带上，这里集中说明。
+
+### 复权因子：用 `back_factor`，别跨时间比 `fore_factor`
+
+spring 自 2026-09-10 起废弃 baostock 复权源，`ADJ_FACTOR` 改由本地自算（`CAPITAL_DETAIL` 除权事件 + `STOCK_DAILY` 收盘价）。
+
+- `back_factor` / `adjust_factor`：累计后复权因子，绝对水位稳定、跨时间可比，算历史收益率用它。
+- `fore_factor`：以该股**最新事件**为锚的累计前复权因子（最新事件行恒为 1.0）。该股每新增一次除权事件，整条历史 `fore_factor` 都会被重算平移——它只在同一次取数内部自洽，**不可跨日期缓存或与旧结果比较**。数值都贴着 1.0，算错了也极难察觉。
+
+### 停牌日：靠 `tradestatus` 识别，不能靠 `close`
+
+`STOCK_DAILY` 中 `tradestatus = 0` 表示停牌，其 `close` 是**前收结转的正数**，不是 0 也不是 NULL，仅看价格无法与正常交易日区分。
+
+- `get_stock_daily` 默认字段已含 `pre_close` 与 `tradestatus`。
+- `calc_indicators` 返回体带 `tradestatus`，停牌日的 `ret_1d` 置空（否则恒为 0，是「没涨没跌」的假信号）；`ma_*` / `vol_ma_*` 仍把停牌日计入窗口，需要剔除请按 `tradestatus` 自行过滤。
+
+### 自省：`deprecated` 为真的对象不要用于分析
+
+生产库里混着已废弃的数据源留痕表（如 `ADJ_FACTOR_RAW`）和人工备份表（`*_BAK_YYYYMMDD` / `*_BACKUP_YYYYMMDD`），结构与正式表几乎一致但数据是过期的。`list_tables` 会给它们打上 `deprecated = true` 并在 `note` 里说明原因。判定规则维护在 `schema.DEPRECATED_TABLES` 与备份表命名约定中。
 
 ## Schema 契约
 

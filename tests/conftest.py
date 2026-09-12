@@ -3,6 +3,7 @@
 #   2026-07-26  Claude  提高 fixture 保真度：STOCK_SW_INDUSTRY_VIEW 改建为真视图(生产库即为视图，
 #                       原先建成表会让 list_tables 只列 BASE TABLE 的缺陷测不出来)；
 #                       STOCK_INFO 补 DECIMAL 列，覆盖 JSON 序列化；新增 load_server_with_env
+#   2026-09-12  Claude  跟随 spring 2026-09 语义：STOCK_DAILY 补 pre_close/tradestatus 与停牌样本行
 """测试夹具。
 
 - `fixture_db`：一个临时 DuckDB 文件，含 schema.TABLES 全部对象与少量样本数据。
@@ -67,15 +68,22 @@ _DDL = [
 
     """CREATE TABLE TRADE_CAL(cal_date VARCHAR, is_open INTEGER)""",
     """INSERT INTO TRADE_CAL VALUES
-        ('2026-07-01',1),('2026-07-02',1),('2026-07-03',0),('2026-07-06',1)""",
+        ('2026-07-01',1),('2026-07-02',1),('2026-07-03',0),('2026-07-06',1),
+        ('2026-07-07',1)""",
 
+    # 列序与生产库 STOCK_DAILY 对齐，含 pre_close / tradestatus。
+    # 07-07 为停牌日(tradestatus=0)：生产数据里停牌行的 close 是前收结转的正数，
+    # 不是 0 也不是 NULL(spring docs/bug1.md BUG-014 已实证)，fixture 必须同构，
+    # 否则「停牌日被当成正常交易日」的缺陷测不出来。
     """CREATE TABLE STOCK_DAILY(
         code VARCHAR, date VARCHAR, open DOUBLE, high DOUBLE, low DOUBLE,
-        close DOUBLE, volume DOUBLE, amount DOUBLE)""",
+        close DOUBLE, pre_close DOUBLE, tradestatus INTEGER,
+        volume DOUBLE, amount DOUBLE)""",
     """INSERT INTO STOCK_DAILY VALUES
-        ('300085.SZ','2026-07-01',10.0,10.5,9.8,10.2,1000000,10200000),
-        ('300085.SZ','2026-07-02',10.2,10.8,10.1,10.6,1200000,12720000),
-        ('300085.SZ','2026-07-06',10.6,11.0,10.4,10.9,1500000,16350000)""",
+        ('300085.SZ','2026-07-01',10.0,10.5,9.8,10.2,9.9,1,1000000,10200000),
+        ('300085.SZ','2026-07-02',10.2,10.8,10.1,10.6,10.2,1,1200000,12720000),
+        ('300085.SZ','2026-07-06',10.6,11.0,10.4,10.9,10.6,1,1500000,16350000),
+        ('300085.SZ','2026-07-07',10.9,10.9,10.9,10.9,10.9,0,0,0)""",
 
     """CREATE TABLE DAILY_BASIC(
         code VARCHAR, trade_date VARCHAR, turnover_rate DOUBLE, is_st INTEGER)""",
@@ -86,9 +94,10 @@ _DDL = [
     """CREATE TABLE ADJ_FACTOR(
         code VARCHAR, trade_date VARCHAR,
         fore_factor DOUBLE, back_factor DOUBLE, adjust_factor DOUBLE)""",
+    # 07-02 的 fore_factor 置 NULL：数值列的 NULL 在序列化时必须变成 None 而非 NaN
     """INSERT INTO ADJ_FACTOR VALUES
         ('300085.SZ','2026-07-01',1.0,2.5,2.5),
-        ('300085.SZ','2026-07-02',1.0,2.5,2.5)""",
+        ('300085.SZ','2026-07-02',NULL,2.5,2.5)""",
 
     # 生产库里行业对象是 VIEW，fixture 必须同构，否则测不出 list_tables 漏列视图
     """CREATE TABLE SW_INDUSTRY_BASE(
@@ -121,6 +130,13 @@ _DDL = [
     """INSERT INTO MARGIN_SUMMARY_DAILY VALUES
         ('2026-07-01','SZ',1000.0,500.0,5000.0,100.0,50.0,200.0,2000.0,7000.0,'2026-07-01','2026-07-01'),
         ('2026-07-01','SH',2000.0,900.0,9000.0,150.0,70.0,300.0,3000.0,12000.0,'2026-07-01','2026-07-01')""",
+
+    # 生产库里与契约对象并存的「不该被消费」的对象：已废弃的数据源留痕表 +
+    # 人工备份表。fixture 必须同构，否则 list_tables 的打标逻辑测不出来。
+    """CREATE TABLE ADJ_FACTOR_RAW(
+        code VARCHAR, trade_date VARCHAR, back_factor DOUBLE)""",
+    """CREATE TABLE ADJ_FACTOR_BAK_20260906(
+        code VARCHAR, trade_date VARCHAR, back_factor DOUBLE)""",
 
     """CREATE TABLE CAPITAL_DETAIL(
         code VARCHAR, date VARCHAR, category VARCHAR)""",

@@ -12,6 +12,13 @@
 #                       5) parse_code 返回规范化 code，各 Tool 用它入 SQL(原先带空白会查空)
 #                       6) MAX_ROWS/MAX_DAYS 环境变量真正生效，与 README 对齐
 #                       7) get_stock_info 返回 found 标志，不再静默降级
+#   2026-09-12  Claude  跟随 spring 2026-09 语义变更 3 项 + 途中发现的 1 项既有缺陷:
+#                       1) get_adj_factor 文档写明 fore_factor 锚定最新事件、不可跨时间比较
+#                          (spring 2026-09-10 起 ADJ_FACTOR 改本地自算，见其 docs/bug1.md BUG-007)
+#                       2) STOCK_DAILY 默认字段补 pre_close/tradestatus，停牌日 ret_1d 置空
+#                          (停牌行 close 是前收结转的正数，见 spring docs/bug1.md BUG-014)
+#                       3) list_tables 标记已废弃表与人工备份表，避免模型探索时选中过期数据
+#                       4) df_to_payload 修复数值列 NULL 被 map 重推 dtype 后退回 NaN(非法 JSON)
 import os
 import sys
 import re
@@ -174,8 +181,11 @@ def df_to_payload(df: pd.DataFrame, max_rows: int, sql_limit: int | None = None)
     #   2) datetime/Decimal/timedelta/bytes 等转可序列化值——否则 MCP 无法序列化
     #      (NaT 底层为 float，会触发 "'float' object cannot be interpreted as an integer")
     mask = df.notnull()
+    df = df.astype(object).map(_json_safe)
+    # 置空必须放在 map 之后：DataFrame.map 会按列重新推断 dtype，一个「数值 + None」
+    # 的 object 列会被推回 float64，先前置好的 None 又变回 NaN(非法 JSON 字面量)。
+    # mask 取自转换前的原始 df，故 NaT/NaN 无论被 _json_safe 转成什么都会被覆盖为 None。
     df = df.astype(object).where(mask, None)
-    df = df.map(_json_safe)
     return {
         "columns": list(df.columns),
         "rows": df.to_dict(orient="records"),
@@ -292,6 +302,9 @@ def get_etl_pipeline() -> dict[str, Any]:
 def list_tables() -> dict[str, Any]:
     """
     List all base tables and views in DuckDB.
+
+    deprecated=true 的对象不要用于分析：note 列说明原因(已废弃的数据源留痕表，
+    或某次变更前的人工备份快照)，其中的数据是过期的。
     """
     # 必须含 VIEW：契约对象里 STOCK_SW_INDUSTRY_VIEW 是视图，
     # 只列 BASE TABLE 会让行业数据在自省时“不存在”。
@@ -303,6 +316,10 @@ def list_tables() -> dict[str, Any]:
         ORDER BY table_schema, table_name
         """
     )
+    # 生产库里混着已废弃的留痕表与人工备份表，结构和正式表几乎一样。不打标的话，
+    # 模型按表名探索时会挑中它们并静默拿到过期数据，故随行返回原因。
+    df["note"] = df["table_name"].map(schema.deprecation_note)
+    df["deprecated"] = df["note"].notnull()
     return df_to_payload(df, MAX_ROWS_DEFAULT)
 
 
@@ -439,7 +456,12 @@ def _query_stock_daily(
     if not table_exists(schema.TB_STOCK_DAILY):
         raise RuntimeError(f"{schema.TB_STOCK_DAILY} table not found.")
 
-    default_fields = ["date", "open", "high", "low", "close", "volume", "amount"]
+    # tradestatus 必须进默认字段：生产库有 58 万行停牌记录，其 close 是前收结转的
+    # 正数，缺了这一列模型无从分辨停牌日与正常交易日。
+    default_fields = [
+        "date", "open", "high", "low", "close",
+        "pre_close", "tradestatus", "volume", "amount",
+    ]
     use_fields = fields if fields else default_fields
 
     clean_fields = []
@@ -522,12 +544,17 @@ def calc_indicators(
     - returns (pct)
     - MA(close) for given windows
     - VOL_MA(volume) for given windows
+
+    停牌日口径：返回体带 tradestatus 列，停牌日(=0)的 ret_1d 置空；MA / VOL_MA 仍把
+    停牌日计入窗口(其 close 为前收结转、volume 为 0)，需要剔除请按 tradestatus 自行过滤。
     """
     if ma_windows is None or len(ma_windows) == 0:
         ma_windows = [5, 10, 20, 60]
 
     # 指标必须在完整区间上计算，故直接取原始 DataFrame，截断留到最后一步
-    df = _query_stock_daily(code, start_date, end_date, ["date", "close", "volume"])
+    df = _query_stock_daily(
+        code, start_date, end_date, ["date", "close", "volume", "tradestatus"]
+    )
     if len(df) == 0:
         return {"columns": [], "rows": [], "rowcount": 0, "truncated": False}
 
@@ -538,6 +565,11 @@ def calc_indicators(
     df["volume"] = pd.to_numeric(df["volume"], errors="coerce")
 
     df["ret_1d"] = df["close"].pct_change()
+
+    # 停牌日(tradestatus=0)的 close 是前收结转，pct_change 会算出恒为 0 的当日收益率，
+    # 那是「没涨没跌」的假信号，必须置空。停牌次日的收益率则是对停牌前最后真实收盘价
+    # 的变化，语义正确，保留。
+    df.loc[df["tradestatus"] == 0, "ret_1d"] = float("nan")
 
     for w in ma_windows:
         w = int(w)
@@ -561,6 +593,14 @@ def get_adj_factor(
     """
     ADJ_FACTOR(code, trade_date, fore_factor, back_factor, adjust_factor)
     获取复权因子，用于计算前/后复权价格。
+
+    口径提示(spring 2026-09-10 起 ADJ_FACTOR 主源改为本地自算)：
+    - back_factor / adjust_factor：累计后复权因子，绝对水位稳定，跨时间可比，
+      计算历史收益率请优先用它。
+    - fore_factor：以该股【最新事件】为锚的累计前复权因子(最新事件行恒为 1.0)。
+      该股每新增一次除权事件，整条历史 fore_factor 都会被重算平移——它只在
+      「同一次取数内部」自洽，不可跨日期缓存或与旧结果比较，否则会静默算错
+      (数值都贴着 1.0，偏差不易察觉)。
     """
     code = normalize_code(code)
     start_date = validate_date(start_date)
